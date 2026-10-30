@@ -1,0 +1,34 @@
+From 10e831f7fe29be813c40dd0e622abafe46300895 Mon Sep 17 00:00:00 2001
+From: onewireout <301024764+onewireout@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 23:05:56 -0500
+Subject: [PATCH 4/4] perf(vulkan): load q2_0 mat-vec weights with one 16-bit
+ load
+
+Two byte loads per 8 weights become one packed16 load. About 10% faster for the Flash-Next expert shapes on MI25 (gfx900).
+---
+ ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
+index 34be1f7..715198a 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
+@@ -74,8 +74,15 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
+             ibi += p.ncols;
+ 
+ #if K_PER_ITER == 8
++#if defined(DATA_A_Q2_0)
++            // one 16-bit load for the 8 weights instead of two byte loads
++            const uint bits = uint(data_a_packed16[a_offset + ib].qs[iqs / 8u]);
++            vec4 v  = vec4(bits & 3u, (bits >> 2u) & 3u, (bits >> 4u) & 3u, (bits >> 6u) & 3u) - 1.0f;
++            vec4 v2 = vec4((bits >> 8u) & 3u, (bits >> 10u) & 3u, (bits >> 12u) & 3u, bits >> 14u) - 1.0f;
++#else
+             vec4 v = dequantize4(ib, iqs, a_offset);
+             vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
++#endif
+ 
+             const vec2 dm = get_dm(ib, a_offset);
+             if (dm.y != 0) { // quant has min component
+-- 
+2.56.0
+

@@ -1,0 +1,30 @@
+From 51301aff2110d9b3bf51fb1e7d088e83ccff66b1 Mon Sep 17 00:00:00 2001
+From: onewireout <301024764+onewireout@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 23:05:56 -0500
+Subject: [PATCH 3/4] test(backend-ops): add Qwen3.8-Flash-Next q2_0 expert
+ perf cases
+
+---
+ tests/test-backend-ops.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 5716a2b..c679862 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12660,6 +12660,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     }
+ 
+ 
++    // qwen3.8-flash-next: gate and up, down with the expert weights
++    for (int bs : {1, 3}) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
++        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640, 1));
++    }
++
+     // gpt-oss-20b
+     for (int bs : {1, 4, 8, 512}) {
+         for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
+-- 
+2.56.0
+

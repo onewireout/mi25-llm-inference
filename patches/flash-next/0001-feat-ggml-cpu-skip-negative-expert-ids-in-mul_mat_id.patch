@@ -1,0 +1,206 @@
+From b2ee67b6ede856db94d84cabe023ae712a9168c9 Mon Sep 17 00:00:00 2001
+From: onewireout <301024764+onewireout@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 21:21:07 -0500
+Subject: [PATCH 1/4] feat(ggml-cpu): skip negative expert ids in mul_mat_id
+
+A negative id skips the expert and writes a zero output row. Lets a GPU expert cache hand the CPU only the experts it does not hold.
+
+Adds test-mul-mat-id-skip.
+---
+ ggml/src/ggml-cpu/ggml-cpu.c   |   8 +-
+ ggml/src/ggml-cpu/repack.cpp   |   8 +-
+ tests/CMakeLists.txt           |   1 +
+ tests/test-mul-mat-id-skip.cpp | 131 +++++++++++++++++++++++++++++++++
+ 4 files changed, 146 insertions(+), 2 deletions(-)
+ create mode 100644 tests/test-mul-mat-id-skip.cpp
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 4c33369..acbefca 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1652,7 +1652,13 @@ static void ggml_compute_forward_mul_mat_id(
+             for (int id = 0; id < n_ids; ++id) {
+                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+ 
+-                assert(i02 >= 0 && i02 < n_as);
++                // negative id: skip the expert, its output row is zero
++                if (i02 < 0) {
++                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
++                    continue;
++                }
++
++                assert(i02 < n_as);
+ 
+                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
+                 matrix_row_counts[i02] += 1;
+diff --git a/ggml/src/ggml-cpu/repack.cpp b/ggml/src/ggml-cpu/repack.cpp
+index 2632ae3..7f8e433 100644
+--- a/ggml/src/ggml-cpu/repack.cpp
++++ b/ggml/src/ggml-cpu/repack.cpp
+@@ -4855,7 +4855,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+                     const int32_t i02 =
+                         *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
+ 
+-                    GGML_ASSERT(i02 >= 0 && i02 < n_as);
++                    // negative id: skip the expert, its output row is zero
++                    if (i02 < 0) {
++                        memset((char *) op->data + id * op->nb[1] + iid1 * op->nb[2], 0, op->ne[0] * sizeof(float));
++                        continue;
++                    }
++
++                    GGML_ASSERT(i02 < n_as);
+ 
+                     MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = { id, iid1 };
+                     matrix_row_counts[i02] += 1;
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 7631549..3c5c724 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -318,6 +318,7 @@ endif()
+ llama_build(test-backend-ops.cpp LINK ggml)
+ 
+ llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK ggml)
++llama_build_and_test(test-mul-mat-id-skip.cpp  LABEL "main behavior backend"  LINK ggml)
+ llama_build_and_test(test-model-load-cancel.cpp LABEL "model behavior")
+ llama_build_and_test(test-autorelease.cpp       LABEL "model behavior")
+ llama_build_and_test(test-backend-sampler.cpp   LABEL "model behavior backend")
+diff --git a/tests/test-mul-mat-id-skip.cpp b/tests/test-mul-mat-id-skip.cpp
+new file mode 100644
+index 0000000..497aaa1
+--- /dev/null
++++ b/tests/test-mul-mat-id-skip.cpp
+@@ -0,0 +1,131 @@
++// MUL_MAT_ID with negative ids on the CPU backend: a negative id skips the expert and gives a zero output row,
++// the other rows must be bit-identical to a run with all ids set
++
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml.h"
++
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <vector>
++
++static int n_failed = 0;
++
++static void cpu_set_use_ref(ggml_backend_t backend, bool use_ref) {
++    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
++    void (* set_use_ref)(ggml_backend_t, bool) =
++        (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_use_ref");
++    if (!set_use_ref) {
++        fprintf(stderr, "ggml_backend_cpu_set_use_ref not available\n");
++        exit(1);
++    }
++    set_use_ref(backend, use_ref);
++}
++
++static void test_skip(ggml_backend_t backend, ggml_type type, int64_t batch, bool use_ref) {
++    const int64_t K = 256, R = 64, n_experts = 8, k = 4;
++
++    srand(0xBEEF);
++
++    struct ggml_init_params ip = { 64*1024*1024, nullptr, true };
++    struct ggml_context * ctx = ggml_init(ip);
++
++    struct ggml_tensor * as  = ggml_new_tensor_3d(ctx, type, K, R, n_experts);
++    struct ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, batch);
++    struct ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, batch);
++
++    struct ggml_cgraph * gf  = ggml_new_graph(ctx);
++    struct ggml_tensor * dst = ggml_mul_mat_id(ctx, as, b, ids);
++    ggml_build_forward_expand(gf, dst);
++
++    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++
++    std::vector<float> as_f(K*R*n_experts), b_f(K*batch);
++    for (auto & v : as_f) v = (float) rand() / RAND_MAX - 0.5f;
++    for (auto & v : b_f)  v = (float) rand() / RAND_MAX - 0.5f;
++
++    std::vector<uint8_t> as_q(ggml_nbytes(as));
++    ggml_quantize_chunk(type, as_f.data(), as_q.data(), 0, R*n_experts, K, nullptr);
++    ggml_backend_tensor_set(as, as_q.data(), 0, as_q.size());
++    ggml_backend_tensor_set(b, b_f.data(), 0, ggml_nbytes(b));
++
++    std::vector<int32_t> ids_all(k*batch), ids_skip(k*batch);
++    for (int64_t t = 0; t < batch; t++) {
++        for (int64_t e = 0; e < k; e++) {
++            ids_all[t*k + e] = (int32_t) ((t + e*3) % n_experts);
++            // skip every other slot, all slots of every third token
++            ids_skip[t*k + e] = ((t + e) % 2 == 0 || t % 3 == 0) ? -1 : ids_all[t*k + e];
++        }
++    }
++
++    cpu_set_use_ref(backend, use_ref);
++
++    std::vector<float> out_all(ggml_nelements(dst)), out_skip(ggml_nelements(dst));
++
++    ggml_backend_tensor_set(ids, ids_all.data(), 0, ggml_nbytes(ids));
++    ggml_backend_graph_compute(backend, gf);
++    ggml_backend_tensor_get(dst, out_all.data(), 0, ggml_nbytes(dst));
++
++    // dst still holds the full result here, so a skipped row that is not cleared shows up as non-zero
++    ggml_backend_tensor_set(ids, ids_skip.data(), 0, ggml_nbytes(ids));
++    ggml_backend_graph_compute(backend, gf);
++    ggml_backend_tensor_get(dst, out_skip.data(), 0, ggml_nbytes(dst));
++
++    int64_t n_bad = 0, n_skipped = 0;
++    for (int64_t t = 0; t < batch; t++) {
++        for (int64_t e = 0; e < k; e++) {
++            const bool skipped = ids_skip[t*k + e] < 0;
++            n_skipped += skipped;
++            for (int64_t r = 0; r < R; r++) {
++                const int64_t i = (t*k + e)*R + r;
++                const float want = skipped ? 0.0f : out_all[i];
++                if (memcmp(&out_skip[i], &want, sizeof(float)) != 0) {
++                    n_bad++;
++                }
++            }
++        }
++    }
++
++    printf("TEST %-5s batch %3lld %s: %s (%lld of %lld slots skipped, %lld bad values)\n",
++           ggml_type_name(type), (long long) batch, use_ref ? "ref  " : "tiled",
++           n_bad == 0 ? "PASS" : "FAIL", (long long) n_skipped, (long long) (k*batch), (long long) n_bad);
++    if (n_bad != 0) {
++        n_failed++;
++    }
++
++    ggml_backend_buffer_free(buf);
++    ggml_free(ctx);
++}
++
++int main() {
++    // force the tiled path where it applies, so both CPU paths see negative ids
++#if defined(_WIN32)
++    _putenv("GGML_CPU_TILED_MM=1");
++    _putenv("GGML_CPU_TILED_MM_FORCE=1");
++#else
++    setenv("GGML_CPU_TILED_MM", "1", 1);
++    setenv("GGML_CPU_TILED_MM_FORCE", "1", 1);
++#endif
++
++    ggml_backend_load_all();
++    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL);
++    if (!backend) {
++        fprintf(stderr, "no CPU backend\n");
++        return 1;
++    }
++
++    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
++        for (int64_t batch : { 1, 7, 64 }) {
++            for (bool use_ref : { true, false }) {
++                test_skip(backend, type, batch, use_ref);
++            }
++        }
++    }
++
++    ggml_backend_free(backend);
++
++    printf("%s\n", n_failed == 0 ? "all passed" : "FAILED");
++    return n_failed == 0 ? 0 : 1;
++}
+-- 
+2.56.0
+

@@ -1,0 +1,164 @@
+{
+  "schema": "clpeak/run",
+  "format_version": 3,
+  "clpeak_version": "3.0.0",
+  "generated_at": "2026-10-04T02:37:02Z",
+  "duration_s": 9.190213,
+  "build": {
+    "backends": [
+      "Vulkan",
+      "OpenCL",
+      "CPU",
+      "LiteRT",
+      "ONNX"
+    ],
+    "config": "Release"
+  },
+  "host": {
+    "os": "Linux x64",
+    "os_version": "7.2.8-arch1-2",
+    "arch": "x86_64",
+    "cpu": "AMD Ryzen 7 7700X 8-Core Processor",
+    "logical_cores": 16,
+    "memory_bytes": 32746991616
+  },
+  "invocation": {
+    "argv": [
+      "clpeak",
+      "--devices",
+      "vulkan:1,opencl:1",
+      "--global-memory-bandwidth",
+      "-o",
+      "/home/user/mi25-bandwidth.json"
+    ],
+    "target_time_us": 500000,
+    "target_time_us_cpu": 2000000,
+    "warmup": 2,
+    "categories": [
+      "compute",
+      "crypto",
+      "string",
+      "bandwidth",
+      "latency",
+      "ai"
+    ],
+    "tests": [
+      "global-memory-bandwidth"
+    ]
+  },
+  "devices": [
+    {
+      "backend": "Vulkan",
+      "platform": "Vulkan",
+      "name": "AMD Radeon Pro WX 9100 (RADV VEGA10)",
+      "driver": "26.2.4",
+      "type": "gpu",
+      "device_index": 1,
+      "properties": [
+        {
+          "key": "API version",
+          "value": "1.4.354"
+        },
+        {
+          "key": "VRAM",
+          "value": "16368 MB"
+        },
+        {
+          "key": "Compute units",
+          "value": "64"
+        }
+      ],
+      "tests": [
+        {
+          "id": "global_memory_bandwidth",
+          "title": "Global memory bandwidth",
+          "category": "bandwidth",
+          "shape": "homogeneous",
+          "axis": "vector width",
+          "direction": "higher_is_better",
+          "quantity": "bytes_per_second",
+          "unit": "B/s",
+          "description": "How many bytes per second the device can stream out of its main memory, reading a buffer far too large to cache. Each reading fetches a different number of values per instruction, since wider fetches usually pull more through before the memory system saturates.",
+          "duration_s": 1.992361,
+          "metrics": [
+            {
+              "id": "float",
+              "value": 3.548121e+11,
+              "description": "One value per thread at a time -- the plain, unvectorised case."
+            },
+            {
+              "id": "float2",
+              "value": 3.672605e+11,
+              "description": "Two values per thread at a time, as one 2-wide vector."
+            },
+            {
+              "id": "float4",
+              "value": 3.664708e+11,
+              "description": "Four values per thread at a time, as one 4-wide vector."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "backend": "OpenCL",
+      "platform": "AMD Accelerated Parallel Processing",
+      "name": "gfx900:xnack-",
+      "driver": "3581.0 (HSA1.1,LC)",
+      "type": "gpu",
+      "platform_index": 0,
+      "device_index": 1,
+      "properties": [
+        {
+          "key": "Compute units",
+          "value": "64"
+        },
+        {
+          "key": "Clock frequency",
+          "value": "1500 MHz"
+        }
+      ],
+      "tests": [
+        {
+          "id": "global_memory_bandwidth",
+          "title": "Global memory bandwidth",
+          "category": "bandwidth",
+          "shape": "homogeneous",
+          "axis": "vector width",
+          "direction": "higher_is_better",
+          "quantity": "bytes_per_second",
+          "unit": "B/s",
+          "description": "How many bytes per second the device can stream out of its main memory, reading a buffer far too large to cache. Each reading fetches a different number of values per instruction, since wider fetches usually pull more through before the memory system saturates.",
+          "duration_s": 5.19528,
+          "metrics": [
+            {
+              "id": "float",
+              "value": 3.446624e+11,
+              "description": "One value per work-item at a time -- the plain, unvectorised case."
+            },
+            {
+              "id": "float2",
+              "value": 3.521086e+11,
+              "description": "Two values per work-item at a time, as one 2-wide vector."
+            },
+            {
+              "id": "float4",
+              "value": 3.623818e+11,
+              "description": "Four values per work-item at a time, as one 4-wide vector."
+            },
+            {
+              "id": "float8",
+              "value": 3.585015e+11,
+              "description": "Eight values per work-item at a time, as one 8-wide vector."
+            },
+            {
+              "id": "float16",
+              "value": 2.699688e+11,
+              "description": "Sixteen values per work-item at a time, the widest vector OpenCL offers."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

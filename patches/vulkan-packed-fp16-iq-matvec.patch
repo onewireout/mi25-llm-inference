@@ -1,0 +1,474 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index bfc65be..3f8fcd7 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -2894,7 +2894,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     auto const &rm_int_n = [&](uint32_t rows, uint32_t i) { return (is_rdna3 && i >= 4) ? 4u : rows; };
+     // RDNA3: Static 4 rows for all types bench faster than the default
+     auto const &rm_id = [&](uint32_t rows) { return is_rdna3 ? 4u : rows; };
++    // MI25 tuning: per-run overrides for rows per workgroup in mul_mat_vec
++    if (const char *e = getenv("GGML_VK_RM_KQ")) { rm_kq = (uint32_t) atoi(e); }
+     uint32_t rm_iq = 2 * rm_kq;
++    if (const char *e = getenv("GGML_VK_RM_IQ")) { rm_iq = (uint32_t) atoi(e); }
+ 
+     const bool use_subgroups = device->subgroup_arithmetic;
+     // The Imagination proprietary compiler rejects the subgroup-only dequant mul_mat_vec
+@@ -5590,6 +5593,11 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+         }
+     }
+ 
++    // MI25 tuning: GGML_VK_DMMV_WG=large|subgroup overrides the heuristic above
++    if (const char *e = getenv("GGML_VK_DMMV_WG")) {
++        dmmv_wg = strcmp(e, "large") == 0 ? DMMV_WG_SIZE_LARGE : DMMV_WG_SIZE_SUBGROUP;
++    }
++
+     if (b_type == GGML_TYPE_Q8_1) {
+         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+@@ -5678,6 +5686,11 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
+         }
+     }
+ 
++    // MI25 tuning: GGML_VK_DMMV_WG=large|subgroup overrides the heuristic above
++    if (const char *e = getenv("GGML_VK_DMMV_WG")) {
++        dmmv_wg = strcmp(e, "large") == 0 ? DMMV_WG_SIZE_LARGE : DMMV_WG_SIZE_SUBGROUP;
++    }
++
+     if (b_type == GGML_TYPE_Q8_1) {
+         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_s.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_s.comp
+index 42f52b4..782b88f 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_s.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_s.comp
+@@ -1,8 +1,35 @@
+ #version 450
+ #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
++#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require // MI25 packed math test
+ 
+ #include "mul_mat_vec_base.glsl"
+ 
++// MI25 speed-of-light test: 0 = original, 1 = skip lookup+signs, 2 = skip lookup, 3 = skip signs,
++// 4 = fake repacked layout (wide aligned reads, same decode math).
++// Modes 1-3 read the same bytes, mode 4 reads ~2% fewer; all produce garbage output (timing only).
++#define SOL 0
++
++#if SOL == 4
++// raw views of the weight buffer, for the fake repacked layout
++layout (binding = 0) readonly buffer A_U32 {uint data_a_u32[];};
++layout (binding = 0) readonly buffer A_U32V4 {uvec4 data_a_u32v4[];};
++#endif
++
++// MI25 preload test: how many rows ahead to issue weight loads, so memory round trips
++// overlap with math instead of running one row at a time. 0 = original, 8 = all rows up front.
++#define PRELOAD 0
++
++// MI25 packed math test: 1 = unpack, sign and multiply weights two at a time in fp16
++// (Vega packed math), then sum each group of 8 in fp32. 0 = original fp32 math.
++#define PACKED 1
++
++#if PACKED
++// for each 4-bit sign pattern: x = sign bits 0,2 moved to bits 15,31; y = sign bits 1,3 likewise
++shared uvec2 sign_masks[16];
++// the iq3s grid pre-converted to fp16 pairs: x = (byte0, byte2), y = (byte1, byte3)
++shared uvec2 grid_f16[512];
++#endif
++
+ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+@@ -12,28 +39,107 @@ FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+ const uint TPB = NUM_COLS <= 4 ? 8 : 16;
+ const uint NL  = 32 / TPB; // l steps per invocation
+ 
+-void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
++void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows, const bool preload) {
+     const uint ib32 = itid / (TPB / 8);
+     const uint l0   = (itid % (TPB / 8)) * NL;
+     const uint y_idx = i * QUANT_K + 32 * ib32;
+ 
++    // preload only on the full-rows path: on the leftover-rows path num_rows isn't known at
++    // compile time, and the preload branches there blow the whole shader up to 256 VGPRs
++    const bool pl = PRELOAD > 0 && preload;
++
+     uint ibi = a_offset + first_row * num_blocks_per_row + i;
++    float pd[NUM_ROWS];
++    uint pscale[NUM_ROWS];
++    uint pqh[NUM_ROWS];
++    uint pqs[NUM_ROWS][NL];
++    uint psign[NUM_ROWS][NL];
++    const uint ib0 = ibi;
++    // always 0 at runtime (rows are whole superblocks), but the compiler can't prove it.
++    // ANDing a previous row's result with it gives a fake dependency that stops the
++    // compiler from hoisting every row's loads to the top of the loop.
++    const uint dep_zero = p.ncols & (QUANT_K - 1);
++#define LOAD_ROW(r, dep) { \
++        const uint ibp = ib0 + (r) * num_blocks_per_row + (dep); \
++        pd[r] = float(data_a[ibp].d); \
++        pscale[r] = data_a[ibp].scales[ib32/2]; \
++        pqh[r] = data_a[ibp].qh[ib32]; \
++        [[unroll]] for (uint ll = 0; ll < NL; ++ll) { \
++            pqs[r][ll] = uint32_t(data_a_packed16[ibp].qs[4 * ib32 + l0 + ll]); \
++            psign[r][ll] = data_a[ibp].signs[4 * ib32 + l0 + ll]; \
++        } \
++    }
++    if (pl) {
++        [[unroll]] for (uint n = 0; n < PRELOAD && n < num_rows; ++n) {
++            LOAD_ROW(n, 0)
++        }
++    }
+     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+-        const float d = float(data_a[ibi].d);
+-        const uint scale = (data_a[ibi].scales[ib32/2] >> (4 * (ib32 & 1))) & 0xF;
++        if (pl && n + PRELOAD < num_rows) {
++            const uint dep = n > 0 ? (floatBitsToUint(float(temp[0][n - 1])) & dep_zero) : 0;
++            LOAD_ROW(n + PRELOAD, dep)
++        }
++#if SOL == 4
++        // fake repacked layout over the same buffer: a body region of 8 lanes x 12 bytes
++        // (qs + signs) per block, then a header region of 16 bytes (d, scales, qh) per block.
++        // 112 B/block vs 110, so the last ~2% of headers are clamped to stay in bounds.
++        const uint nb_all = p.stride_d * num_blocks_per_row;
++        const uint body = (ibi * 8 + itid) * 3;
++        const uvec3 bq = uvec3(data_a_u32[body], data_a_u32[body + 1], data_a_u32[body + 2]);
++        const uvec4 hdr = data_a_u32v4[nb_all * 6 + min(ibi, (nb_all * 14) / 16 - 1)];
++        const float d = unpackHalf2x16(hdr.x).x;
++        const uint scale = (hdr.y >> (8 * (ib32 / 2) + 4 * (ib32 & 1))) & 0xF;
++        const uint qh = (ib32 < 4 ? hdr.z : hdr.w) >> (8 * (ib32 & 3)) & 0xFF;
++#else
++        const float d = pl ? pd[n] : float(data_a[ibi].d);
++        const uint scale = ((pl ? pscale[n] : uint(data_a[ibi].scales[ib32/2])) >> (4 * (ib32 & 1))) & 0xF;
++        const uint qh = pl ? pqh[n] : uint(data_a[ibi].qh[ib32]);
++#endif
+         const float dscale = d * (1 + 2 * scale);
+-        const uint qh = data_a[ibi].qh[ib32];
+         [[unroll]] for (uint ll = 0; ll < NL; ++ll) {
+             const uint l = l0 + ll;
+-            const u8vec2 qs = unpack8(uint32_t(data_a_packed16[ibi].qs[4 * ib32 + l])).xy; // vec4 used due to #12147
+-            const uint sign = data_a[ibi].signs[4 * ib32 + l];
++#if SOL == 4
++            const u8vec2 qs = unpack8(ll < 2 ? bq.x >> (16 * ll) : bq.y >> (16 * (ll - 2))).xy;
++            const uint sign = (bq.z >> (8 * ll)) & 0xFF;
++#else
++            const u8vec2 qs = unpack8(pl ? pqs[n][ll] : uint32_t(data_a_packed16[ibi].qs[4 * ib32 + l])).xy; // vec4 used due to #12147
++            const uint sign = pl ? psign[n][ll] : uint(data_a[ibi].signs[4 * ib32 + l]);
++#endif
++#if PACKED
++            // grid entries arrive as ready fp16 pairs; signs come as finished masks from a
++            // 16-entry table (one lookup per sign nibble) and flip with one XOR per pair
++            const uvec2 e0 = grid_f16[qs.x | ((qh << (8 - 2*l)) & 0x100)];
++            const uvec2 e1 = grid_f16[qs.y | ((qh << (7 - 2*l)) & 0x100)];
++            const uvec2 sm_lo = sign_masks[sign & 0xF];
++            const uvec2 sm_hi = sign_masks[sign >> 4];
++            const f16vec2 w0 = unpackFloat2x16(e0.x ^ sm_lo.x);
++            const f16vec2 w1 = unpackFloat2x16(e0.y ^ sm_lo.y);
++            const f16vec2 w2 = unpackFloat2x16(e1.x ^ sm_hi.x);
++            const f16vec2 w3 = unpackFloat2x16(e1.y ^ sm_hi.y);
++#elif SOL == 1 || SOL == 2
++            const vec4 grid0 = vec4(qs.x, qs.y, qh & 0xFF, sign);
++            const vec4 grid1 = vec4(qs.y, qs.x, sign, qh & 0xFF);
++#else
+             const vec4 grid0 = vec4(unpack8(iq3s_grid[qs.x | ((qh << (8 - 2*l)) & 0x100)]));
+             const vec4 grid1 = vec4(unpack8(iq3s_grid[qs.y | ((qh << (7 - 2*l)) & 0x100)]));
++#endif
+ 
+             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                 const vec4 b0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 0]);
+                 const vec4 b4 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 1]);
+ 
++#if PACKED
++                const f16vec2 acc = fma(w0, f16vec2(b0.x, b0.z), fma(w1, f16vec2(b0.y, b0.w),
++                                    fma(w2, f16vec2(b4.x, b4.z), w3 * f16vec2(b4.y, b4.w))));
++                const FLOAT_TYPE sum = FLOAT_TYPE(float(acc.x) + float(acc.y));
++#elif SOL == 1 || SOL == 3
++                const FLOAT_TYPE sum =
++                      fma(FLOAT_TYPE(b0.x), FLOAT_TYPE(grid0.x), fma(FLOAT_TYPE(b0.y), FLOAT_TYPE(grid0.y),
++                      fma(FLOAT_TYPE(b0.z), FLOAT_TYPE(grid0.z), fma(FLOAT_TYPE(b0.w), FLOAT_TYPE(grid0.w),
++                      fma(FLOAT_TYPE(b4.x), FLOAT_TYPE(grid1.x), fma(FLOAT_TYPE(b4.y), FLOAT_TYPE(grid1.y),
++                      fma(FLOAT_TYPE(b4.z), FLOAT_TYPE(grid1.z), fma(FLOAT_TYPE(b4.w), FLOAT_TYPE(grid1.w),
++                      FLOAT_TYPE(sign & 1)))))))));
++#else
+                 const FLOAT_TYPE sum =
+                       fma(FLOAT_TYPE(b0.x), FLOAT_TYPE((sign &   1) != 0 ? -grid0.x : grid0.x),
+                       fma(FLOAT_TYPE(b0.y), FLOAT_TYPE((sign &   2) != 0 ? -grid0.y : grid0.y),
+@@ -44,6 +150,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid,
+                       fma(FLOAT_TYPE(b4.z), FLOAT_TYPE((sign &  64) != 0 ? -grid1.z : grid1.z),
+                       fma(FLOAT_TYPE(b4.w), FLOAT_TYPE((sign & 128) != 0 ? -grid1.w : grid1.w),
+                       FLOAT_TYPE(0.0)))))))));
++#endif
+ 
+                 temp[j][n] = fma(dscale, sum, temp[j][n]);
+             }
+@@ -52,7 +159,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid,
+     }
+ }
+ 
+-void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
++void compute_outputs(const uint32_t first_row, const uint32_t num_rows, const bool preload) {
+     uint a_offset, b_offset, d_offset;
+     get_offsets(a_offset, b_offset, d_offset);
+ 
+@@ -71,7 +178,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+     }
+ 
+     [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += blocks_per_wg)
+-        calc_superblock(a_offset, b_offset, itid, i, num_blocks_per_row, first_row, num_rows);
++        calc_superblock(a_offset, b_offset, itid, i, num_blocks_per_row, first_row, num_rows, preload);
+ 
+     reduce_result(temp, d_offset, first_row, num_rows, tid);
+ }
+@@ -79,15 +186,34 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+ void main() {
+     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+ 
++#if PACKED
++    // grid bytes are small odd ints; OR-ing 0x64 into a byte's high half makes the fp16
++    // value 1024 + byte, so subtracting 1024 converts two bytes at once
++    [[unroll]] for (uint i = 0; i < 512; i += gl_WorkGroupSize.x) {
++        if (i + gl_LocalInvocationIndex < 512) {
++            const uint g = iq3s_grid_const[i + gl_LocalInvocationIndex];
++            const f16vec2 bias = f16vec2(1024.0);
++            grid_f16[i + gl_LocalInvocationIndex] = uvec2(
++                packFloat2x16(unpackFloat2x16(( g       & 0x00FF00FFu) | 0x64006400u) - bias),
++                packFloat2x16(unpackFloat2x16(((g >> 8) & 0x00FF00FFu) | 0x64006400u) - bias));
++        }
++    }
++    if (gl_LocalInvocationIndex < 16) {
++        const uint s = gl_LocalInvocationIndex;
++        sign_masks[s] = uvec2(((s & 1) << 15) | ((s & 4) << 29), ((s & 2) << 14) | ((s & 8) << 28));
++    }
++    barrier();
++#else
+     init_iq_shmem(gl_WorkGroupSize);
++#endif
+ 
+     // do NUM_ROWS at a time, unless there aren't enough remaining rows
+     if (first_row + NUM_ROWS <= p.stride_d) {
+-        compute_outputs(first_row, NUM_ROWS);
++        compute_outputs(first_row, NUM_ROWS, true);
+     } else {
+         if (first_row >= p.stride_d) {
+             return;
+         }
+-        compute_outputs(first_row, p.stride_d - first_row);
++        compute_outputs(first_row, p.stride_d - first_row, false);
+     }
+ }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_xxs.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_xxs.comp
+index a888981..e8f99f9 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_xxs.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq3_xxs.comp
+@@ -1,8 +1,21 @@
+ #version 450
+ #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
++#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require // MI25 packed math test
+ 
+ #include "mul_mat_vec_base.glsl"
+ 
++// MI25 packed math test: 1 = signed weights from fp16 tables, multiplied two at a time
++// (Vega packed math), each group of 8 summed in fp32. 0 = original fp32 math.
++#define PACKED 1
++
++#if PACKED
++// iq3xxs grid as fp16 pairs: x = (byte0, byte2), y = (byte1, byte3). values stored /4
++// (exact: grid bytes are multiples of 2 up to 62) to keep fp16 sums far from overflow
++shared uvec2 grid_f16[256];
++// for each 4-bit sign pattern: x = sign bits 0,2 moved to bits 15,31; y = sign bits 1,3 likewise
++shared uvec2 sign_masks[16];
++#endif
++
+ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+@@ -23,13 +36,30 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid,
+             const uint qs1 = data_a[ibi].qs[8 * ib32 + 4 * (itid & 1) + 2 * l + 1];
+             const uint sign = bitfieldExtract(signscale, 7 * int(2 * (itid & 1) + l), 7);
+             const uint sign7 = bitCount(sign);
++#if PACKED
++            const uint sign8 = sign | ((sign7 & 1) << 7);
++            const uvec2 e0 = grid_f16[qs0];
++            const uvec2 e1 = grid_f16[qs1];
++            const uvec2 sm_lo = sign_masks[sign8 & 0xF];
++            const uvec2 sm_hi = sign_masks[sign8 >> 4];
++            const f16vec2 w0 = unpackFloat2x16(e0.x ^ sm_lo.x);
++            const f16vec2 w1 = unpackFloat2x16(e0.y ^ sm_lo.y);
++            const f16vec2 w2 = unpackFloat2x16(e1.x ^ sm_hi.x);
++            const f16vec2 w3 = unpackFloat2x16(e1.y ^ sm_hi.y);
++#else
+             const vec4 grid0 = vec4(unpack8(iq3xxs_grid[qs0]));
+             const vec4 grid1 = vec4(unpack8(iq3xxs_grid[qs1]));
++#endif
+ 
+             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                 const vec4 b0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 0]);
+                 const vec4 b4 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 1]);
+ 
++#if PACKED
++                const f16vec2 acc = fma(w0, f16vec2(b0.x, b0.z), fma(w1, f16vec2(b0.y, b0.w),
++                                    fma(w2, f16vec2(b4.x, b4.z), w3 * f16vec2(b4.y, b4.w))));
++                const FLOAT_TYPE sum = FLOAT_TYPE(4.0 * (float(acc.x) + float(acc.y)));
++#else
+                 FLOAT_TYPE sum =
+                       fma(FLOAT_TYPE(b0.x), FLOAT_TYPE((sign &   1) != 0 ? -grid0.x : grid0.x),
+                       fma(FLOAT_TYPE(b0.y), FLOAT_TYPE((sign &   2) != 0 ? -grid0.y : grid0.y),
+@@ -40,6 +70,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid,
+                       fma(FLOAT_TYPE(b4.z), FLOAT_TYPE((sign &  64) != 0 ? -grid1.z : grid1.z),
+                       fma(FLOAT_TYPE(b4.w), FLOAT_TYPE((sign7 &  1) != 0 ? -grid1.w : grid1.w),
+                       FLOAT_TYPE(0.0)))))))));
++#endif
+                 temp[j][n] = fma(db, sum, temp[j][n]);
+             }
+         }
+@@ -74,7 +105,21 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+ void main() {
+     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+ 
++#if PACKED
++    [[unroll]] for (uint i = 0; i < 256; i += gl_WorkGroupSize.x) {
++        if (i + gl_LocalInvocationIndex < 256) {
++            const vec4 g = vec4(unpack8(iq3xxs_grid_const[i + gl_LocalInvocationIndex])) / 4.0;
++            grid_f16[i + gl_LocalInvocationIndex] = uvec2(packFloat2x16(f16vec2(g.x, g.z)), packFloat2x16(f16vec2(g.y, g.w)));
++        }
++    }
++    if (gl_LocalInvocationIndex < 16) {
++        const uint s = gl_LocalInvocationIndex;
++        sign_masks[s] = uvec2(((s & 1) << 15) | ((s & 4) << 29), ((s & 2) << 14) | ((s & 8) << 28));
++    }
++    barrier();
++#else
+     init_iq_shmem(gl_WorkGroupSize);
++#endif
+ 
+     // do NUM_ROWS at a time, unless there aren't enough remaining rows
+     if (first_row + NUM_ROWS <= p.stride_d) {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq4_xs.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq4_xs.comp
+index a2b99d9..d80dbc2 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq4_xs.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_iq4_xs.comp
+@@ -1,9 +1,20 @@
+ #version 450
+ 
+ #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
++#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require // MI25 packed math test
+ 
+ #include "mul_mat_vec_base.glsl"
+ 
++// MI25 packed math test: 1 = weights from an fp16 pair table, multiplied two at a time
++// (Vega packed math), each group of 8 summed in fp32. 0 = original fp32 math.
++#define PACKED 1
++
++#if PACKED
++// one entry per qs byte: fp16 pair (kvalue[low nibble], kvalue[high nibble]). values stored /8
++// (exact: kvalues are ints within +-127) to keep fp16 sums far from overflow
++shared uint kv_pair[256];
++#endif
++
+ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+@@ -28,13 +39,26 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ib32,
+ 
+         [[unroll]] for (uint l = 0; l < 4; ++l) {
+             const uint w = data_a_packed32[ibi].qs[4 * ib32 + l];
++#if PACKED
++            // byte k holds the weights for b0[k] (low nibble) and b1[k] (high nibble)
++            const f16vec2 w0 = unpackFloat2x16(kv_pair[ w        & 0xFF]);
++            const f16vec2 w1 = unpackFloat2x16(kv_pair[(w >>  8) & 0xFF]);
++            const f16vec2 w2 = unpackFloat2x16(kv_pair[(w >> 16) & 0xFF]);
++            const f16vec2 w3 = unpackFloat2x16(kv_pair[ w >> 24]);
++#else
+             const u8vec4 q0 = unpack8(w & 0x0F0F0F0F);
+             const u8vec4 q1 = unpack8((w >> 4) & 0x0F0F0F0F);
++#endif
+ 
+             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                 const vec4 b0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + l]);
+                 const vec4 b1 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 4 + l]);
+ 
++#if PACKED
++                const f16vec2 acc = fma(w0, f16vec2(b0.x, b1.x), fma(w1, f16vec2(b0.y, b1.y),
++                                    fma(w2, f16vec2(b0.z, b1.z), w3 * f16vec2(b0.w, b1.w))));
++                sum[j] += FLOAT_TYPE(8.0 * (float(acc.x) + float(acc.y)));
++#else
+                 sum[j] = fma(FLOAT_TYPE(b0.x), FLOAT_TYPE(kvalues_iq4nl[q0.x]),
+                         fma(FLOAT_TYPE(b0.y), FLOAT_TYPE(kvalues_iq4nl[q0.y]),
+                         fma(FLOAT_TYPE(b0.z), FLOAT_TYPE(kvalues_iq4nl[q0.z]),
+@@ -44,6 +68,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint ib32,
+                         fma(FLOAT_TYPE(b1.z), FLOAT_TYPE(kvalues_iq4nl[q1.z]),
+                         fma(FLOAT_TYPE(b1.w), FLOAT_TYPE(kvalues_iq4nl[q1.w]),
+                         sum[j]))))))));
++#endif
+             }
+         }
+ 
+@@ -83,7 +108,18 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+ void main() {
+     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+ 
++#if PACKED
++    [[unroll]] for (uint i = 0; i < 256; i += gl_WorkGroupSize.x) {
++        if (i + gl_LocalInvocationIndex < 256) {
++            const uint b = i + gl_LocalInvocationIndex;
++            kv_pair[b] = packFloat2x16(f16vec2(float(kvalues_iq4nl_const[b & 0xF]) / 8.0,
++                                               float(kvalues_iq4nl_const[b >> 4]) / 8.0));
++        }
++    }
++    barrier();
++#else
+     init_iq_shmem(gl_WorkGroupSize);
++#endif
+ 
+     // do NUM_ROWS at a time, unless there aren't enough remaining rows
+     if (first_row + NUM_ROWS <= p.stride_d) {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_k.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_k.comp
+index 93fbacc..a6065a6 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_k.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_k.comp
+@@ -4,6 +4,10 @@
+ 
+ #include "mul_mat_vec_base.glsl"
+ 
++// MI25 min hoist test: 1 = sum each group of B values once per superblock instead of once
++// per row (the sums don't depend on the row), so smin costs 4 fmas per row instead of 16.
++#define MIN_HOIST 1
++
+ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+@@ -12,6 +16,20 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im,
+     const uint y1_idx = i * QUANT_K + y_offset;
+     const uint y2_idx = y1_idx + 128;
+ 
++#if MIN_HOIST
++    FLOAT_TYPE bsum[NUM_COLS][4];
++    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
++        const vec4 by10 =  vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y1_idx) / 4    ]);
++        const vec4 by132 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y1_idx) / 4 + 8]);
++        const vec4 by20 =  vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y2_idx) / 4    ]);
++        const vec4 by232 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y2_idx) / 4 + 8]);
++        bsum[j][0] = FLOAT_TYPE(by10.x + by10.y + by10.z + by10.w);
++        bsum[j][1] = FLOAT_TYPE(by132.x + by132.y + by132.z + by132.w);
++        bsum[j][2] = FLOAT_TYPE(by20.x + by20.y + by20.z + by20.w);
++        bsum[j][3] = FLOAT_TYPE(by232.x + by232.y + by232.z + by232.w);
++    }
++#endif
++
+     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+         const uint ib0 = a_offset + (first_row+n)*num_blocks_per_row;
+         const FLOAT_TYPEV2 dm = FLOAT_TYPEV2(data_a[ib0 + i].dm);
+@@ -74,11 +92,15 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im,
+             const FLOAT_TYPE sy = fma(FLOAT_TYPE(by132.x),     q4_4,  fma(FLOAT_TYPE(by132.y), q4_5,  fma(FLOAT_TYPE(by132.z), q4_6,  FLOAT_TYPE(by132.w) * q4_7)));
+             const FLOAT_TYPE sz = fma(FLOAT_TYPE(by20.x),      q4_8,  fma(FLOAT_TYPE(by20.y),  q4_9,  fma(FLOAT_TYPE(by20.z),  q4_10, FLOAT_TYPE(by20.w) *  q4_11)));
+             const FLOAT_TYPE sw = fma(FLOAT_TYPE(by232.x),     q4_12, fma(FLOAT_TYPE(by232.y), q4_13, fma(FLOAT_TYPE(by232.z), q4_14, FLOAT_TYPE(by232.w) * q4_15)));
++#if MIN_HOIST
++            const FLOAT_TYPE smin = fma(bsum[j][0], sc2, fma(bsum[j][1], sc3, fma(bsum[j][2], sc6, bsum[j][3] * sc7)));
++#else
+             const FLOAT_TYPE smin =
+                 fma(FLOAT_TYPE(by10.x), sc2, fma(FLOAT_TYPE(by132.x), sc3, fma(FLOAT_TYPE(by20.x), sc6, fma(FLOAT_TYPE(by232.x), sc7,
+                 fma(FLOAT_TYPE(by10.y), sc2, fma(FLOAT_TYPE(by132.y), sc3, fma(FLOAT_TYPE(by20.y), sc6, fma(FLOAT_TYPE(by232.y), sc7,
+                 fma(FLOAT_TYPE(by10.z), sc2, fma(FLOAT_TYPE(by132.z), sc3, fma(FLOAT_TYPE(by20.z), sc6, fma(FLOAT_TYPE(by232.z), sc7,
+                 fma(FLOAT_TYPE(by10.w), sc2, fma(FLOAT_TYPE(by132.w), sc3, fma(FLOAT_TYPE(by20.w), sc6,     FLOAT_TYPE(by232.w) * sc7)))))))))))))));
++#endif
+             temp[j][n] = fma(dm.x, fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))), fma(-dm.y, smin, temp[j][n]));
+         }
+     }
